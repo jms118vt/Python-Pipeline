@@ -1,3 +1,4 @@
+"""
 Electrophysiology Spike Processing Pipeline
 
 This script implements an end-to-end pipeline for:
