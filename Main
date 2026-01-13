@@ -1,0 +1,297 @@
+Electrophysiology Spike Processing Pipeline
+
+This script implements an end-to-end pipeline for:
+    1. Loading electrophysiology recordings
+    2. Cleaning and bandpass filtering neural signals
+    3. Detecting spike events
+    4. Extracting waveform features
+    5. Performing statistical A/B testing
+    6. Fitting likelihood models
+    7. Exporting results for further research analysis
+
+Designed to be readable, modular, and reusable.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy import signal, stats
+from sklearn.mixture import GaussianMixture
+from pathlib import Path
+
+
+# ============================================================
+# DATA LOADING
+# ============================================================
+
+def load_ephys_data(file_path):
+    """
+    Load electrophysiology data from CSV.
+
+    Expected format:
+        Column 0 → time vector
+        Columns 1+ → voltage channels
+
+    Returns:
+        time (np.ndarray)
+        signals (np.ndarray) [samples x channels]
+    """
+
+    # Read CSV file into DataFrame
+    df = pd.read_csv(file_path)
+
+    # Extract time column
+    time = df.iloc[:, 0].values
+
+    # Extract signal channels
+    signals = df.iloc[:, 1:].values
+
+    return time, signals
+
+
+# ============================================================
+# SIGNAL CLEANING / FILTERING
+# ============================================================
+
+def bandpass_filter(signal_data, fs, low=300, high=3000, order=3):
+    """
+    Bandpass filter isolates neural spike frequencies.
+
+    Typical extracellular spikes live between 300–3000 Hz.
+
+    Args:
+        signal_data (np.ndarray): Raw voltage signal
+        fs (float): Sampling frequency (Hz)
+
+    Returns:
+        np.ndarray: Filtered signal
+    """
+
+    # Nyquist frequency
+    nyq = 0.5 * fs
+
+    # Design Butterworth filter
+    b, a = signal.butter(
+        order,
+        [low / nyq, high / nyq],
+        btype="band"
+    )
+
+    # Apply zero-phase filtering (prevents phase distortion)
+    filtered_signal = signal.filtfilt(b, a, signal_data)
+
+    return filtered_signal
+
+
+# ============================================================
+# SPIKE DETECTION
+# ============================================================
+
+def detect_spikes(filtered_signal, threshold_std=4, refractory=30):
+    """
+    Detect spikes using adaptive threshold crossing.
+
+    A spike is detected when the signal drops below
+    a negative threshold based on signal noise.
+
+    Args:
+        filtered_signal (np.ndarray)
+        threshold_std (float): Noise multiplier
+        refractory (int): Minimum samples between spikes
+
+    Returns:
+        np.ndarray: Spike indices
+    """
+
+    # Estimate background noise level
+    noise_std = np.std(filtered_signal)
+
+    # Set detection threshold
+    threshold = -threshold_std * noise_std
+
+    # Find all samples below threshold
+    spike_candidates = np.where(filtered_signal < threshold)[0]
+
+    # Enforce refractory period to prevent double-counting spikes
+    spikes = []
+    last_spike = -np.inf
+
+    for idx in spike_candidates:
+        if idx - last_spike > refractory:
+            spikes.append(idx)
+            last_spike = idx
+
+    return np.array(spikes)
+
+
+# ============================================================
+# FEATURE EXTRACTION
+# ============================================================
+
+def extract_spike_features(signal_data, spike_indices, window=40):
+    """
+    Extract quantitative features from each spike waveform.
+
+    Features:
+        - Peak amplitude
+        - Energy
+        - Approximate width
+
+    Args:
+        signal_data (np.ndarray)
+        spike_indices (np.ndarray)
+
+    Returns:
+        pd.DataFrame
+    """
+
+    features = []
+
+    for idx in spike_indices:
+
+        # Skip boundary cases
+        if idx - window < 0 or idx + window >= len(signal_data):
+            continue
+
+        # Extract waveform snippet around spike
+        waveform = signal_data[idx - window : idx + window]
+
+        # Peak voltage (minimum for extracellular spikes)
+        peak = np.min(waveform)
+
+        # Energy represents signal power
+        energy = np.sum(waveform ** 2)
+
+        # Width approximates duration of spike
+        width = np.sum(waveform < peak / 2)
+
+        features.append([peak, energy, width])
+
+    # Convert to labeled DataFrame
+    return pd.DataFrame(
+        features,
+        columns=["peak", "energy", "width"]
+    )
+
+
+# ============================================================
+# STATISTICAL ANALYSIS
+# ============================================================
+
+def ab_test(group_a, group_b, metric):
+    """
+    Compare feature distributions between two conditions.
+
+    Uses a two-sample t-test.
+
+    Returns:
+        dict: t-statistic and p-value
+    """
+
+    stat, pval = stats.ttest_ind(
+        group_a[metric],
+        group_b[metric]
+    )
+
+    return {
+        "metric": metric,
+        "t_stat": stat,
+        "p_value": pval
+    }
+
+
+def fit_likelihood_model(features, n_components=2):
+    """
+    Fit a Gaussian Mixture Model to spike features.
+
+    Used to estimate likelihood of latent neural populations.
+
+    Returns:
+        model
+        log_likelihood
+    """
+
+    model = GaussianMixture(n_components=n_components)
+    model.fit(features)
+
+    # Average log-likelihood of data under model
+    log_likelihood = model.score(features)
+
+    return model, log_likelihood
+
+
+# ============================================================
+# PIPELINE DRIVER
+# ============================================================
+
+def run_pipeline(file_a, file_b, fs=30000, output_dir="results"):
+    """
+    Execute the full analysis pipeline.
+
+    Steps:
+        Load → Filter → Detect → Extract → Test → Model → Export
+    """
+
+    # Load datasets for two experimental conditions
+    time_a, sig_a = load_ephys_data(file_a)
+    time_b, sig_b = load_ephys_data(file_b)
+
+    # Filter first channel (extendable to multichannel)
+    filt_a = bandpass_filter(sig_a[:, 0], fs)
+    filt_b = bandpass_filter(sig_b[:, 0], fs)
+
+    # Detect spikes
+    spikes_a = detect_spikes(filt_a)
+    spikes_b = detect_spikes(filt_b)
+
+    # Extract features
+    feat_a = extract_spike_features(filt_a, spikes_a)
+    feat_b = extract_spike_features(filt_b, spikes_b)
+
+    # Perform A/B statistical testing
+    stats_results = []
+    for metric in ["peak", "energy", "width"]:
+        stats_results.append(ab_test(feat_a, feat_b, metric))
+
+    # Fit likelihood model on combined dataset
+    combined_features = pd.concat([feat_a, feat_b], ignore_index=True)
+    model, log_likelihood = fit_likelihood_model(combined_features)
+
+    # Create output directory
+    Path(output_dir).mkdir(exist_ok=True)
+
+    # Export results for downstream analysis
+    feat_a.to_csv(f"{output_dir}/features_A.csv", index=False)
+    feat_b.to_csv(f"{output_dir}/features_B.csv", index=False)
+    pd.DataFrame(stats_results).to_csv(
+        f"{output_dir}/statistics.csv",
+        index=False
+    )
+
+    # Return summary metrics
+    return {
+        "spike_count_A": len(spikes_a),
+        "spike_count_B": len(spikes_b),
+        "log_likelihood": log_likelihood
+    }
+
+
+# ============================================================
+# SCRIPT ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    """
+    Example execution when running directly:
+        python ephys_pipeline.py
+    """
+
+    # Example file paths (replace with real data)
+    file_a = "data/session_A.csv"
+    file_b = "data/session_B.csv"
+
+    results = run_pipeline(file_a, file_b)
+
+    print("\nPipeline Results")
+    print("================")
+    for k, v in results.items():
+        print(f"{k}: {v}")
